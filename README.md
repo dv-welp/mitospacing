@@ -55,18 +55,18 @@ pip install -r requirements.txt
 
 ## Usage
 
-1. Open `mit_distribution_pipeline.py` and edit the config block at the top:
+1. Open `mitospacing.py` and edit the config block at the top:
    - `ROOT`: path to your date folder
    - `PX_PER_UM`: your image calibration (pixels per µm)
    - `PEAK_DISTANCE`, `PEAK_PROMINENCE`: peak-detection sensitivity
 2. Run the review loop:
    ```bash
-   python mit_distribution_pipeline.py
+   python mitospacing.py
    ```
    When every image is marked done, a dialog offers to run the analysis.
 3. To re-run analysis on the current workbook without reviewing anything:
    ```bash
-   python mit_distribution_pipeline.py --analyze
+   python mitospacing.py --analyze
    ```
 
 To re-open an image you already marked done, clear its `reviewed` cell in the workbook, save and close the workbook, then rerun the script.
