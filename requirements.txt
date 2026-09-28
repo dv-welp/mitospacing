@@ -1,0 +1,9 @@
+numpy
+scipy
+matplotlib
+tifffile
+roifile
+openpyxl
+pandas
+seaborn
+scikit-posthocs
