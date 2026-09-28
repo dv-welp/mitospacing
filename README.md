@@ -13,33 +13,28 @@ I built this for my own imaging analysis, so it is a working research tool rathe
 - Automated mitochondrial detection
 - Interactive review and correction
 - Quantitative spatial analysis
-- Excel export
+- Excel export for correction tracking
+- Graphical and tabular analysis output
 
 **Visual Overview**
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/66f13c79-8009-49c1-964e-39cdbc08d832"
-       width="800"
-       alt="MitoSpacing workflow demonstration">
-</p>
-
-<p align="center">
-  <em>Workflow demonstration</em>
-</p>
-
 <table>
   <tr>
-    <td align="center">
-      <img src="https://github.com/user-attachments/assets/cade5343-1f08-433f-a15d-2e5d5f2a6f18"
-           width="100%"
-           alt="Interactive analysis panel">
+    <td align="center" width="60%">
+      <img
+        src="YOUR_DEMO_GIF_URL"
+        width="100%"
+        alt="MitoSpacing interactive review panel"
+      />
       <br>
-      <em>Interactive analysis panel</em>
+      <em>Interactive review panel</em>
     </td>
-    <td align="center">
-      <img src="https://github.com/user-attachments/assets/fc99c430-8bc5-4cbe-beff-9769a08f8657"
-           width="100%"
-           alt="Quantitative analysis output">
+    <td align="center" width="40%">
+      <img
+        src="https://github.com/user-attachments/assets/fc99c430-8bc5-4cbe-beff-9769a08f8657"
+        width="100%"
+        alt="MitoSpacing quantitative analysis output"
+      />
       <br>
       <em>Quantitative analysis output</em>
     </td>
@@ -66,6 +61,15 @@ Once every image is reviewed (or with `--analyze`), the script computes:
 - Group comparisons: Shapiro-Wilk normality check, then one-way ANOVA or Kruskal-Wallis, with Dunn's post-hoc test (Holm-corrected) when applicable
 
 Outputs (saved to `analysis_output/` next to the workbook): summary Excel file, violin/box plots, histograms per genotype, Morisita plots, and table images of the statistics.
+
+## Quantitative analyses
+
+- Mitochondrial density
+- Neurite length
+- Distance of first mitochondrion to the cell body
+- Normalised frequency histogram of inter-mitochondrial distances
+- Fano factor 
+- Morishita's index of dispersion plotted against bin size
 
 ## Expected folder layout
 
