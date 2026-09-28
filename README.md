@@ -73,7 +73,10 @@ To re-open an image you already marked done, clear its `reviewed` cell in the wo
 
 ## Screenshots
 
-<!-- Add: review panel, example plot, example workbook sheet -->
+<img width="956" height="474" alt="Screenshot 2026-09-21 133547" src="https://github.com/user-attachments/assets/cade5343-1f08-433f-a15d-2e5d5f2a6f18" />
+<img width="582" height="329" alt="Screenshot 2026-09-28 180139" src="https://github.com/user-attachments/assets/fc99c430-8bc5-4cbe-beff-9769a08f8657" />
+
+
 
 ## Known limitations
 
