@@ -54,22 +54,15 @@ I built this for my own imaging analysis, so it is a working research tool rathe
 
 **2. Analysis**
 Once every image is reviewed (or with `--analyze`), the script computes:
-- Mitochondrial density (per 100 µm), process length, and distance of the first mitochondrion from the cell body
-- Intermitochondrial distance (IMD) distributions, binned in 3 µm steps
+- Mitochondrial density (per 100 µm),
+- Process length
+- Distance of the first mitochondrion from the cell body
+- Normalised frequency histogram of inter-mitochondrial distances
 - Fano factor per process
 - Morisita index across a range of compartment sizes (10 µm and 20 µm steps)
 - Group comparisons: Shapiro-Wilk normality check, then one-way ANOVA or Kruskal-Wallis, with Dunn's post-hoc test (Holm-corrected) when applicable
 
 Outputs (saved to `analysis_output/` next to the workbook): summary Excel file, violin/box plots, histograms per genotype, Morisita plots, and table images of the statistics.
-
-## Quantitative analyses
-
-- Mitochondrial density
-- Neurite length
-- Distance of first mitochondrion to the cell body
-- Normalised frequency histogram of inter-mitochondrial distances
-- Fano factor 
-- Morishita's index of dispersion plotted against bin size
 
 ## Expected folder layout
 
