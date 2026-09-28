@@ -1,41 +1,3 @@
-"""
-Mitochondrial distribution pipeline -- review + analysis, one file.
-
-Folder layout expected:
-    ROOT (a date folder)
-      |- genotype_1/
-      |     (flat layout: image + .roi files directly here, matched by name)
-      |     OR (nested layout: one subfolder per animal, each with one image + one .roi)
-      |- genotype_2/
-      |- ...
-
-Run modes:
-    python mit_distribution_pipeline.py            -> review loop, then offer to run analysis
-                                                       once every image is marked done
-    python mit_distribution_pipeline.py --analyze  -> skip the review loop entirely and just
-                                                       run analysis on the workbook as it is now
-
-Review panel controls:
-    - click near a green dot to REMOVE that peak
-    - click empty space to ADD a peak there
-    - type in the Comment box to leave a note
-    - "Save & Close": saves progress, image stays open for later review
-    - "Mark Done & Close": saves progress AND marks the image reviewed,
-      so future runs skip it
-    - closing the window (X) behaves like "Save & Close" -- nothing is
-      ever lost by closing, on purpose or by accident
-    - if the workbook can't be saved (e.g. it's open in Excel), your edits
-      are written to a timestamped backup file instead of being lost
-
-To re-open an image you already marked done: open the workbook, find that
-image's column, clear/uncheck its "reviewed" cell, save+close the workbook,
-then rerun the script.
-
-Analysis (run_analysis) imports seaborn/scipy.stats/scikit_posthocs itself,
-lazily, only when it actually runs -- a plain review session never pays for
-loading those libraries.
-"""
-
 import os
 import re
 import sys
@@ -56,12 +18,12 @@ import tkinter as tk
 from tkinter import messagebox
 
 # ---------------- CONFIG ----------------
-ROOT = r"C:\Users\devya\Documents\Education-TM\TIFR\SPK Lab\2020 biorxiv\regulators o_0\20200904 analysis"
-PX_PER_UM = 6.5923
+ROOT = r"path/to/your/date_folder""
+PX_PER_UM = 6.59
 PEAK_DISTANCE = 5
 PEAK_PROMINENCE = 10
 CLICK_TOLERANCE_UM = 5
-PEAK_LABEL_PREFIX = "mit#"               # rename here if you want a different label later
+PEAK_LABEL_PREFIX = "mit#"               
 IMAGE_EXTENSIONS = ('.tif', '.tiff')
 ROI_SUFFIX_HINTS = ('roi',)              # words to strip when matching roi filenames
 IMAGE_SUFFIX_HINTS = ('mosaic',)         # words to strip when matching image filenames (also catches "MosaicJ", "mosaic2", etc.)
