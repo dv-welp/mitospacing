@@ -87,3 +87,7 @@ To re-open an image you already marked done, clear its `reviewed` cell in the wo
 ## Data
 
 No data is included in this repository. Example images and outputs shown above are for illustration only.
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
