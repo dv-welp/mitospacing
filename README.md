@@ -22,7 +22,7 @@ I built this for my own imaging analysis, so it is a working research tool rathe
   <tr>
     <td align="center" width="60%">
       <img
-        src="YOUR_DEMO_GIF_URL"
+        src="https://github.com/user-attachments/assets/66f13c79-8009-49c1-964e-39cdbc08d832"
         width="100%"
         alt="MitoSpacing interactive review panel"
       />
