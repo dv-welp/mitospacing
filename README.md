@@ -8,6 +8,44 @@ I built this for my own imaging analysis, so it is a working research tool rathe
 
 ## What it does
 
+**Features**
+
+- Automated mitochondrial detection
+- Interactive review and correction
+- Quantitative spatial analysis
+- Excel export
+
+**Visual Overview**
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/66f13c79-8009-49c1-964e-39cdbc08d832"
+       width="800"
+       alt="MitoSpacing workflow demonstration">
+</p>
+
+<p align="center">
+  <em>Workflow demonstration</em>
+</p>
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/cade5343-1f08-433f-a15d-2e5d5f2a6f18"
+           width="100%"
+           alt="Interactive analysis panel">
+      <br>
+      <em>Interactive analysis panel</em>
+    </td>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/fc99c430-8bc5-4cbe-beff-9769a08f8657"
+           width="100%"
+           alt="Quantitative analysis output">
+      <br>
+      <em>Quantitative analysis output</em>
+    </td>
+  </tr>
+</table>
+
 **1. Review (interactive)**
 - Reads each TIFF image plus its ImageJ/Fiji `.roi` trace and samples the intensity profile along the trace.
 - Auto-detects peaks (candidate mitochondria) with `scipy.signal.find_peaks`.
@@ -71,11 +109,13 @@ pip install -r requirements.txt
 
 To re-open an image you already marked done, clear its `reviewed` cell in the workbook, save and close the workbook, then rerun the script.
 
-## Screenshots
+<!--
+## Visual Overview
 
+<img width="800" height="450" alt="mitospacing_demo" src="https://github.com/user-attachments/assets/66f13c79-8009-49c1-964e-39cdbc08d832" />
 <img width="956" height="474" alt="Screenshot 2026-09-21 133547" src="https://github.com/user-attachments/assets/cade5343-1f08-433f-a15d-2e5d5f2a6f18" />
 <img width="582" height="329" alt="Screenshot 2026-09-28 180139" src="https://github.com/user-attachments/assets/fc99c430-8bc5-4cbe-beff-9769a08f8657" />
-
+-->
 
 
 ## Known limitations
