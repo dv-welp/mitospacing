@@ -1,3 +1,73 @@
+"""
+Mitochondrial distribution pipeline -- review + analysis, one file.
+
+Folder layout expected:
+    ROOT (a date folder)
+      |- genotype_1/
+      |     (flat layout: image + .roi files directly here, matched by name)
+      |     OR (nested layout: one subfolder per animal, each with one image + one .roi)
+      |- genotype_2/
+      |- ...
+
+Run modes:
+    python mitospacing.py            -> review loop, then offer to run analysis
+                                        once every image is marked done
+    python mitospacing.py --analyze  -> skip the review loop entirely and just
+                                        run analysis on the workbook as it is now
+
+Stopping part-way through reviewing, and resuming later:
+    The review loop opens one image at a time and there is no "quit" button:
+    "Save & Close", "Mark Done & Close" and the window's X all save the image
+    you are on and then the script opens the NEXT one. To stop for the day:
+      1. On the image you're on, click "Save & Close" (or "Mark Done & Close"
+         if you're finished with it). This writes its peaks + comment to the
+         workbook.
+      2. When the next image's window appears, leave it alone, click the
+         terminal and press Ctrl+C. Nothing is lost: everything you saved is
+         already in the workbook, and the window you just opened has no edits.
+      (If you press Ctrl+C while an image has edits you have NOT saved with one
+       of the buttons, those edits are lost.)
+    To resume: run the same command again (python mitospacing.py) with the same
+    ROOT set below. Images you marked done are skipped; images you only "Save &
+    Close"d re-open with the peaks and comment you left; untouched images start
+    from the auto-detected peaks. Make sure the workbook isn't open in Excel
+    first, or the save will fall back to an _UNSAVED_ backup file.
+
+Review panel controls:
+    - click near a green dot to REMOVE that peak
+    - click empty space to ADD a peak there
+    - type in the Comment box to leave a note
+    - "Save & Close": saves progress, image stays open for later review
+    - "Mark Done & Close": saves progress AND marks the image reviewed,
+      so future runs skip it
+    - closing the window (X) behaves like "Save & Close" -- nothing is
+      ever lost by closing, on purpose or by accident
+    - if the workbook can't be saved (e.g. it's open in Excel), your edits
+      are written to a timestamped backup file instead of being lost
+
+To re-open an image you already marked done: open the workbook, find that
+image's column, clear/uncheck its "reviewed" cell, save+close the workbook,
+then rerun the script.
+
+Analysis (run_analysis) reads the workbook (one sheet per genotype, one column
+per animal) and writes stats tables, a summary workbook and figures to an
+"analysis_output" folder next to it. Workbook format it understands
+(column A = row labels, column B onward = animals):
+    Id            <- header row: one animal ID per column
+    length(um) / length_um
+    density       <- ignored for stats; recomputed from peak count and length
+    number        <- ignored for stats; recomputed from peak count
+    comment, reviewed, blank rows, "*" marker rows ... are all ignored
+    mit #1, mit #2, ... / mit#1, mit#2, ...   <- peak positions in um from the cell body
+Row order, label spelling (spaces, "#", "(um)" vs "_um") and formulas-with-cached-values
+are all handled. Sheets named corrections_log / unmatched_files are skipped.
+It imports pandas/seaborn/scipy.stats/scikit_posthocs itself, lazily, only when
+it actually runs -- a plain review session never pays for loading those libraries.
+
+Needs: numpy, pandas, openpyxl, matplotlib, seaborn, scipy, scikit-posthocs,
+       tifffile, roifile
+"""
+
 import os
 import re
 import sys
@@ -18,18 +88,24 @@ import tkinter as tk
 from tkinter import messagebox
 
 # ---------------- CONFIG ----------------
-ROOT = r"path/to/your/date_folder""
-PX_PER_UM = 6.59
+ROOT = os.path.dirname(os.path.abspath(__file__))   # the folder this script sits in; to use a different folder, replace with r"C:\path\to\folder"
+PX_PER_UM = 6.5923
 PEAK_DISTANCE = 5
 PEAK_PROMINENCE = 10
 CLICK_TOLERANCE_UM = 5
-PEAK_LABEL_PREFIX = "mit#"               
+PEAK_LABEL_PREFIX = "mit#"               # rename here if you want a different label later
 IMAGE_EXTENSIONS = ('.tif', '.tiff')
 ROI_SUFFIX_HINTS = ('roi',)              # words to strip when matching roi filenames
 IMAGE_SUFFIX_HINTS = ('mosaic',)         # words to strip when matching image filenames (also catches "MosaicJ", "mosaic2", etc.)
 LOG_SHEET_NAME = "corrections_log"
 UNMATCHED_SHEET_NAME = "unmatched_files"
 UTILITY_SHEETS = {LOG_SHEET_NAME, UNMATCHED_SHEET_NAME}   # excluded when analysis looks for genotype sheets
+ANALYSIS_DIR_NAME = "analysis_output"                    # analysis writes here; never treated as a genotype folder
+NOT_ITALIC = {"wildtype", "wild type", "wt", "n2"}   # names that are not gene names; remove entries to italicise everything
+BIN_WIDTH_UM = 3
+BIN_MAX_UM = 66
+COMP_RANGE_20 = np.arange(80, 420, 20)               # Morisita compartment sizes (um)
+N_PARCELS = 5
 # -------------------------------------------------------
 
 DATE_NAME = os.path.basename(ROOT.rstrip("\\/")) or "data"
@@ -475,398 +551,403 @@ def annotate_animal(wb, genotype_name, animal):
 
 # ==================== analysis ====================
 
-def parse_and_verify_sheet(filepath, sheet_name):
-    """
-    Reads one genotype sheet from the workbook produced by this pipeline.
-    Finds 'density', 'length_um', 'number' by label (order-independent), and
-    treats every row whose label starts with PEAK_LABEL_PREFIX ("mit#") as a
-    coordinate row -- so it doesn't matter how many peaks a given image has.
-    """
+def _load_analysis_libs():
+    """Imports the analysis-only libraries on first use and publishes them as
+    module-level names (pd, sns, sp, shapiro, ...) for the functions below, so a
+    plain review session never pays for loading them."""
+    global pd, sns, sp, shapiro, kruskal, f_oneway, tukey_hsd
     import pandas as pd
+    import seaborn as sns
+    import scikit_posthocs as sp
+    from scipy.stats import shapiro, kruskal, f_oneway, tukey_hsd
 
-    df = pd.read_excel(filepath, sheet_name=sheet_name, header=None)
-    labels = df[0].astype(str).str.strip().str.lower().tolist()
 
-    try:
-        density_row_idx = labels.index('density')
-        length_row_idx = labels.index('length_um')
-        number_row_idx = labels.index('number')
-    except ValueError:
-        missing = [label for label in ['density', 'length_um', 'number'] if label not in labels]
-        raise ValueError(f"Sheet '{sheet_name}' is missing these expected row labels in column A: {missing}")
+def gstyle(name):
+    """Font style for a genotype name."""
+    return "normal" if str(name).strip().lower() in NOT_ITALIC else "italic"
 
-    id_row_idx = 0  # "Id" is always the header row in this workbook's format
 
-    sample_data = df.iloc[density_row_idx, 1:]
-    n_samples = len(sample_data.dropna())
+def style_texts(texts, names):
+    for t, n in zip(texts, names):
+        t.set_fontstyle(gstyle(n))
 
-    sample_ids = df.iloc[id_row_idx, 1:n_samples + 1].tolist()
 
-    excel_densities = pd.to_numeric(df.iloc[density_row_idx, 1:n_samples + 1], errors='coerce').values
-    process_lengths = pd.to_numeric(df.iloc[length_row_idx, 1:n_samples + 1], errors='coerce').values
-    excel_counts = pd.to_numeric(df.iloc[number_row_idx, 1:n_samples + 1], errors='coerce').values
+# ==================== reading the workbook ====================
 
-    for idx, sample_id in enumerate(sample_ids):
-        if pd.isna(process_lengths[idx]) or process_lengths[idx] == 0:
+def _norm_label(x):
+    return re.sub(r"[\s_#()]", "", str(x).strip().lower()) if x is not None else ""
+
+
+def read_sheet(wb, sheet_name):
+    ws = wb[sheet_name]
+    rows = list(ws.iter_rows(values_only=True))
+    labels = [_norm_label(r[0]) if r else "" for r in rows]
+
+    def find(prefix):
+        for i, l in enumerate(labels):
+            if l.startswith(prefix):
+                return i
+        return None
+
+    id_i, len_i = find("id"), find("length")
+    dens_i, num_i = find("density"), find("number")
+    if id_i is None or len_i is None:
+        raise ValueError(f"Sheet '{sheet_name}': could not find an 'Id' row and a 'length' row in column A.")
+    mit_rows = [i for i, l in enumerate(labels) if re.fullmatch(r"mit\d+", l)]
+    if not mit_rows:
+        raise ValueError(f"Sheet '{sheet_name}': no 'mit #n' rows found.")
+    # Peak block = first 'mit #' row to the bottom of the sheet. Rows in it with a blank
+    # label still count as peaks (the number row's COUNT() range includes them).
+    peak_rows = [i for i in range(mit_rows[0], len(rows)) if labels[i] == "" or i in mit_rows]
+    unlabeled = [i + 1 for i in peak_rows if i not in mit_rows
+                 and any(isinstance(v, (int, float)) and not isinstance(v, bool) for v in rows[i][1:])]
+    if unlabeled:
+        print(f"[Info] {sheet_name}: peak values found in unlabeled rows {unlabeled}; included.")
+
+    def num(v):
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else np.nan
+
+    ids, lengths, peaks, stored_dens = [], [], [], []
+    n_cols = max(len(r) for r in rows)
+    for c in range(1, n_cols):
+        sid = rows[id_i][c] if c < len(rows[id_i]) else None
+        if sid is None or str(sid).strip() == "":
             continue
-        calc_density = (excel_counts[idx] / process_lengths[idx]) * 100
-        if not np.isclose(calc_density, excel_densities[idx], atol=1e-2, equal_nan=True):
-            print(f"[MISMATCH WARNING] Sheet: {sheet_name} | Sample: {sample_id} | "
-                  f"Excel Density: {excel_densities[idx]:.3f}, Calculated: {calc_density:.3f}")
+        L = num(rows[len_i][c]) if c < len(rows[len_i]) else np.nan
+        col_peaks = []
+        for r in peak_rows:
+            v = rows[r][c] if c < len(rows[r]) else None
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                col_peaks.append(float(v))
+        ids.append(str(sid).strip())
+        lengths.append(L)
+        peaks.append(sorted(col_peaks))
+        stored_dens.append(num(rows[dens_i][c]) if dens_i is not None and c < len(rows[dens_i]) else np.nan)
 
-    peak_row_indices = [i for i, label in enumerate(labels)
-                        if isinstance(label, str) and label.startswith(PEAK_LABEL_PREFIX)]
-    coord_matrix = df.iloc[peak_row_indices, 1:n_samples + 1].apply(pd.to_numeric, errors='coerce').values
+        if num_i is not None:
+            stored_n = num(rows[num_i][c]) if c < len(rows[num_i]) else np.nan
+            if not np.isnan(stored_n) and int(stored_n) != len(col_peaks):
+                print(f"[WARNING] {sheet_name} | {ids[-1]}: 'number' row says {int(stored_n)} "
+                      f"but {len(col_peaks)} peak values found.")
 
-    raw_absolute_distances = []
-    for col_idx in range(n_samples):
-        coords = coord_matrix[:, col_idx]
-        coords = coords[~np.isnan(coords) & (coords > 0)]
-        raw_absolute_distances.append(list(sorted(coords)))
+    lengths = np.array(lengths)
+    counts = np.array([len(p) for p in peaks])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        density = counts / lengths * 100
+    stored_dens = np.array(stored_dens)
+    for sid, d, sd in zip(ids, density, stored_dens):
+        if not np.isnan(sd) and not np.isclose(d, sd, atol=1e-2):
+            print(f"[WARNING] {sheet_name} | {sid}: stored density {sd:.3f} vs recomputed {d:.3f} (using recomputed).")
+    return ids, density, lengths, peaks
 
-    return sample_ids, excel_densities, process_lengths, raw_absolute_distances
 
+# ==================== metrics ====================
 
-def compute_spatial_metrics(raw_absolute_distances, comp_sizes_10, comp_sizes_20, no_of_parcel=5):
-    """
-    Computes IMD tables, binned distributions, Fano factors,
-    and Morisita's Index for both 10um and 20um steps.
-    """
-    intermitochondrial_distances = []
-    first_mit_distances = []
-
-    for coords in raw_absolute_distances:
+def compute_spatial_metrics(peaks, comp_sizes, no_of_parcel=N_PARCELS):
+    imds_all, first_mit = [], []
+    for coords in peaks:
         if len(coords) == 0:
-            intermitochondrial_distances.append([])
-            first_mit_distances.append(np.nan)
+            imds_all.append([])
+            first_mit.append(np.nan)
             continue
-        first_mit_distances.append(coords[0])
+        first_mit.append(coords[0])
         imds = [coords[0]]
         if len(coords) > 1:
             imds.extend(np.diff(coords))
-        intermitochondrial_distances.append(imds)
+        imds_all.append(list(imds))
 
-    bins = np.arange(0, 66 + 3, 3)
-    abs_freqs, norm_freqs, fano_factors = [], [], []
-
-    for imds in intermitochondrial_distances:
+    bins = np.arange(0, BIN_MAX_UM + BIN_WIDTH_UM, BIN_WIDTH_UM)
+    abs_freq, norm_freq, fano = [], [], []
+    for imds in imds_all:
         counts, _ = np.histogram(imds, bins=bins)
-        abs_freqs.append(counts)
-        norm_freqs.append(counts / len(imds) if len(imds) > 0 else counts * 0)
+        abs_freq.append(counts)
+        norm_freq.append(counts / len(imds) if len(imds) > 0 else counts * 0)
+        m = np.mean(counts)
+        fano.append(np.var(counts, ddof=1) / m if m > 0 else np.nan)
 
-        mean_c = np.mean(counts)
-        var_c = np.var(counts, ddof=1)
-        fano_factors.append(var_c / mean_c if mean_c > 0 else np.nan)
-
-    def run_morisita_loop(sizes):
-        results = np.zeros((len(sizes), len(raw_absolute_distances)))
-        for idx, comp_size in enumerate(sizes):
-            size_of_parcel = comp_size / no_of_parcel
-            for j, coords in enumerate(raw_absolute_distances):
-                parcel_counts = np.zeros(no_of_parcel)
-                for n in range(no_of_parcel):
-                    parcel_counts[n] = np.sum((np.array(coords) > size_of_parcel * n) &
-                                               (np.array(coords) <= size_of_parcel * (n + 1)))
-                N = np.sum(parcel_counts)
-                if N > 1:
-                    results[idx, j] = no_of_parcel * (np.sum(parcel_counts * (parcel_counts - 1)) / (N * (N - 1)))
-                else:
-                    results[idx, j] = np.nan
-        return results
-
-    morisita_10 = run_morisita_loop(comp_sizes_10)
-    morisita_20 = run_morisita_loop(comp_sizes_20)
-
-    return (intermitochondrial_distances, first_mit_distances,
-            np.array(abs_freqs), np.array(norm_freqs), fano_factors, morisita_10, morisita_20)
+    morisita = np.full((len(comp_sizes), len(peaks)), np.nan)
+    for idx, comp in enumerate(comp_sizes):
+        parcel = comp / no_of_parcel
+        for j, coords in enumerate(peaks):
+            arr = np.array(coords)
+            pc = np.array([np.sum((arr > parcel * n) & (arr <= parcel * (n + 1))) for n in range(no_of_parcel)])
+            N = pc.sum()
+            if N > 1:
+                morisita[idx, j] = no_of_parcel * (np.sum(pc * (pc - 1)) / (N * (N - 1)))
+    return imds_all, np.array(first_mit), np.array(norm_freq), np.array(fano), morisita
 
 
-def save_table_figure(df, title, out_path):
-    """Renders a DataFrame as a simple table image and saves it."""
+def sem(x):
+    x = np.asarray(x, dtype=float)
+    x = x[~np.isnan(x)]
+    return np.std(x, ddof=1) / np.sqrt(len(x)) if len(x) > 1 else np.nan
+
+
+# ==================== table figures ====================
+
+def save_table_figure(df, title, out_path, italic_first_col=False, italic_header=False):
     n_rows, n_cols = len(df), len(df.columns)
-    fig_width = max(6, 1.6 * n_cols)
-    fig_height = 0.5 * n_rows + 1.2
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    ax.axis('off')
-    table = ax.table(
-        cellText=df.round(4).astype(str).values,
-        colLabels=df.columns,
-        cellLoc='center',
-        loc='center',
-        bbox=[0, 0, 1, 1],
-    )
+    fig, ax = plt.subplots(figsize=(max(6, 1.6 * n_cols), 0.5 * n_rows + 1.2))
+    ax.axis("off")
+    table = ax.table(cellText=df.round(4).astype(str).values, colLabels=df.columns,
+                     cellLoc="center", loc="center", bbox=[0, 0, 1, 1])
     table.auto_set_font_size(False)
     table.set_fontsize(10)
     table.auto_set_column_width(col=list(range(n_cols)))
-    ax.set_title(title, fontweight='bold', pad=18, fontsize=14)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=300, bbox_inches='tight')
-    plt.close()
+    for (r, c), cell in table.get_celld().items():
+        if italic_first_col and c == 0 and r > 0:
+            cell.get_text().set_fontstyle(gstyle(df.iloc[r - 1, 0]))
+        if italic_header and r == 0 and c > 0:
+            cell.get_text().set_fontstyle(gstyle(df.columns[c]))
+    ax.set_title(title, fontweight="bold", pad=18, fontsize=14)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 
-def generate_publication_plots(results_store, genotypes, comp_range_10, comp_range_20, output_dir):
-    import seaborn as sns
+# ==================== plots ====================
 
-    def outpath(name):
-        return os.path.join(output_dir, name)
+def stars(p):
+    return "****" if p < 0.0001 else "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
 
-    palette = sns.color_palette("Set2", len(genotypes))
 
-    all_densities = [results_store[g]['densities'] for g in genotypes]
-    all_lengths = [results_store[g]['lengths'] for g in genotypes]
-    all_first_mit = [results_store[g]['first_mit'] for g in genotypes]
+def sem_note(ax):
+    ax.text(1.0, 1.01, "mean \u00b1 SEM", transform=ax.transAxes, ha="right", va="bottom", fontsize=10)
 
-    morphology_traits = [
-        (all_densities, "Mitochondrial Density", r"Density (per 100 $\mu$m)", "plot_density.png"),
-        (all_lengths, "Process Length", r"Length ($\mu$m)", "plot_length.png"),
-        (all_first_mit, "Distance of 1st Mit from CB", r"Distance ($\mu$m)", "plot_first_mit.png")
+
+def draw_brackets(ax, genotypes, pmat):
+    """Bracket + stars for every significant pair in the post-hoc p-value matrix."""
+    if pmat is None:
+        return
+    pairs = []
+    for i in range(len(genotypes)):
+        for j in range(i + 1, len(genotypes)):
+            p = pmat.loc[genotypes[i], genotypes[j]]
+            if stars(p):
+                pairs.append((i, j, p))
+    if not pairs:
+        return
+    pairs.sort(key=lambda t: (t[1] - t[0], t[0]))
+    lo, hi = ax.get_ylim()
+    step = (hi - lo) * 0.10
+    tiers = []                                   # list of lists of (i, j) already placed per tier
+    for i, j, p in pairs:
+        t = 0
+        while t < len(tiers) and any(not (j < a or i > b) for a, b in tiers[t]):
+            t += 1
+        if t == len(tiers):
+            tiers.append([])
+        tiers[t].append((i, j))
+        y = hi + step * (t + 0.5)
+        tick = step * 0.18
+        ax.plot([i, i, j, j], [y - tick, y, y, y - tick], color="black", linewidth=1.5, clip_on=False)
+        ax.text((i + j) / 2, y, stars(p), ha="center", va="bottom", fontsize=13, fontweight="bold")
+    ax.set_ylim(lo, hi + step * (len(tiers) + 0.9))
+
+
+def generate_plots(res, genotypes, output_dir, pvals):
+    out = lambda n: os.path.join(output_dir, n)
+    pal = dict(zip(genotypes, sns.color_palette("Set2", len(genotypes))))
+
+    # ---- morphology plots: identical figure + axes size ----
+    traits = [
+        ("densities", "Mitochondrial Density", r"Density (per 100 $\mu$m)", "plot_density.png"),
+        ("lengths", "Process Length", r"Length ($\mu$m)", "plot_length.png"),
+        ("first_mit", "Distance of First Mit from Cell Body", r"Distance of first mit ($\mu$m)", "plot_first_mit.png"),
     ]
+    for key, title, ylabel, fname in traits:
+        long = pd.DataFrame([(g, v) for g in genotypes for v in res[g][key] if not np.isnan(v)],
+                            columns=["Genotype", "Value"])
+        fig = plt.figure(figsize=(7, 6))
+        fig.subplots_adjust(left=0.18, right=0.97, bottom=0.14, top=0.88)
+        ax = fig.add_subplot(111)
+        kw = dict(data=long, x="Genotype", y="Value", order=genotypes, ax=ax)
+        sns.violinplot(**kw, hue="Genotype", palette=pal, legend=False, inner=None, linewidth=1.5, alpha=0.3, cut=0)
+        sns.boxplot(**kw, hue="Genotype", palette=pal, legend=False, width=0.12, showfliers=False,
+                    boxprops=dict(alpha=0.7))
+        sns.stripplot(**kw, color="black", alpha=0.2, jitter=0.12, size=4)
+        for i, g in enumerate(genotypes):
+            vals = np.asarray(res[g][key], dtype=float)
+            vals = vals[~np.isnan(vals)]
+            ax.errorbar(i, np.mean(vals), yerr=sem(vals), fmt="o", color="darkred", elinewidth=2.5,
+                        markersize=8, zorder=5)
+        draw_brackets(ax, genotypes, pvals.get(key))
+        ax.set_xlabel("")
+        ax.set_ylabel(ylabel, labelpad=10)
+        ax.set_title(title, fontweight="bold", pad=22, fontsize=14)
+        sem_note(ax)
+        sns.despine(ax=ax, offset=10, trim=True)
+        # tick labels are set LAST: despine(trim=True) rebuilds the ticks and would undo the italics
+        ax.set_xticks(range(len(genotypes)))
+        ax.set_xticklabels(genotypes)
+        for t, g in zip(ax.get_xticklabels(), genotypes):
+            t.set_fontstyle(gstyle(g))
+        fig.savefig(out(fname), dpi=300)
+        plt.close(fig)
 
-    for data_list, title, ylabel, filename in morphology_traits:
-        plt.figure(figsize=(7, 6))
+    # ---- histograms: one shared y-limit, one fixed axes size ----
+    bins = np.arange(0, BIN_MAX_UM + BIN_WIDTH_UM, BIN_WIDTH_UM)
+    centers = (bins[:-1] + bins[1:]) / 2
+    labels_upper = [str(b) for b in bins[1:]]
+    hist = {g: (np.mean(res[g]["norm_freq"], axis=0),
+                np.std(res[g]["norm_freq"], axis=0, ddof=1) / np.sqrt(len(res[g]["norm_freq"])))
+            for g in genotypes}
+    ymax = max(np.nanmax(m + s) for m, s in hist.values()) * 1.08
 
-        sns.violinplot(data=data_list, palette=palette, inner=None, alpha=0.3, linewidth=1.5)
-        sns.boxplot(data=data_list, palette=palette, width=0.12, boxprops=dict(alpha=0.7), showfliers=False, color="black")
-        sns.stripplot(data=data_list, color='black', alpha=0.2, jitter=0.12, size=4)
+    for g in genotypes:
+        fig = plt.figure(figsize=(8, 5))
+        fig.subplots_adjust(left=0.16, right=0.97, bottom=0.22, top=0.82)
+        ax = fig.add_subplot(111)
+        m, s = hist[g]
+        ax.bar(centers, m, width=BIN_WIDTH_UM * 0.8, yerr=s, color=pal[g], alpha=0.7, edgecolor=pal[g],
+               linewidth=1.5, error_kw=dict(ecolor="black", elinewidth=1.5, capsize=2))
+        fig.suptitle("Normalised Frequency Histogram", fontweight="bold", fontsize=14, y=0.97)
+        ax.set_title(g, fontstyle=gstyle(g), fontsize=13, pad=8)
+        sem_note(ax)
+        ax.set_xlabel(r"Intermitochondrial Distance Bins ($\mu$m)", labelpad=10)
+        ax.set_ylabel("Probability Density", labelpad=10)
+        ax.set_ylim(0, ymax)
+        ax.set_xticks(centers)
+        ax.set_xticklabels([l if i % 2 == 1 else "" for i, l in enumerate(labels_upper)], fontsize=10)
+        sns.despine(ax=ax, offset=10, trim=True)
+        fig.savefig(out(f"plot_histogram_{g}.png"), dpi=300)
+        plt.close(fig)
 
-        for i, d in enumerate(data_list):
-            clean_d = np.array(d)[~np.isnan(d)]
-            mean_val = np.mean(clean_d)
-            sem_val = np.std(clean_d, ddof=1) / np.sqrt(len(clean_d)) if len(clean_d) > 0 else 0
+    # ---- Morisita (20 um steps) ----
+    fig = plt.figure(figsize=(7, 6))
+    fig.subplots_adjust(left=0.18, right=0.96, bottom=0.16, top=0.88)
+    ax = fig.add_subplot(111)
+    for g in genotypes:
+        mor = res[g]["morisita"]
+        ax.errorbar(COMP_RANGE_20, np.nanmean(mor, axis=1),
+                    yerr=np.nanstd(mor, axis=1, ddof=1) / np.sqrt(np.sum(~np.isnan(mor), axis=1)),
+                    fmt="-s", color=pal[g], label=g, linewidth=2, capsize=3, markersize=5)
+    ax.axhline(1.0, color="gray", linestyle="--", linewidth=1.5)
+    ax.set_xlabel(r"Compartment size ($\mu$m)", labelpad=10)
+    ax.set_ylabel(r"I-delta index ($I_\delta$)", labelpad=10)
+    ax.set_title(r"Morisita Index ($20\,\mu$m steps)", fontweight="bold", pad=15, fontsize=14)
+    sem_note(ax)
+    leg = ax.legend(frameon=True, fontsize=10, loc="best")
+    style_texts(leg.get_texts(), genotypes)
+    sns.despine(ax=ax, offset=10, trim=True)
+    fig.savefig(out("plot_morisita_20um.png"), dpi=300)
+    plt.close(fig)
 
-            plt.errorbar(i, mean_val, yerr=sem_val, fmt='o', color='darkred', elinewidth=2.5, markersize=8, zorder=5)
 
-            y_axis_range = plt.gca().get_ylim()[1] - plt.gca().get_ylim()[0]
-            y_text_pos = plt.gca().get_ylim()[1] - (y_axis_range * 0.08)
-
-            plt.text(i, y_text_pos, f"{mean_val:.2f} \u00b1 {sem_val:.2f}",
-                     ha='center', va='center', color='darkred', weight='bold', fontsize=11,
-                     bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', boxstyle='round,pad=0.2'))
-
-        plt.xticks(range(len(genotypes)), genotypes)
-        plt.ylabel(ylabel, labelpad=10)
-        plt.title(title, fontweight='bold', pad=20, fontsize=14)
-        sns.despine(offset=10, trim=True)
-        plt.tight_layout()
-        plt.savefig(outpath(filename), dpi=300)
-        plt.close()
-
-    bins_3um = np.arange(0, 66 + 3, 3)
-    bin_labels_upper = [str(bins_3um[i + 1]) for i in range(len(bins_3um) - 1)]
-    bin_centers = (bins_3um[:-1] + bins_3um[1:]) / 2
-
-    for i, g in enumerate(genotypes):
-        plt.figure(figsize=(8, 5))
-        nf = results_store[g]['norm_freq']
-
-        mean_profile = np.mean(nf, axis=0)
-        sem_profile = np.std(nf, axis=0, ddof=1) / np.sqrt(len(nf))
-
-        plt.bar(bin_centers, mean_profile, width=2.4, yerr=sem_profile,
-                color=palette[i], alpha=0.7, edgecolor=palette[i], linewidth=1.5,
-                error_kw=dict(ecolor='black', elinewidth=1.5, capsize=2))
-
-        plt.title(f"Normalised Frequency Histogram - {g}", fontweight='bold', pad=15, fontsize=14)
-        plt.xlabel(r"Intermitochondrial Distance Bins ($\mu$m)", labelpad=10)
-        plt.ylabel("Probability Density", labelpad=10)
-
-        display_labels = [label if idx % 2 == 1 else "" for idx, label in enumerate(bin_labels_upper)]
-        plt.xticks(bin_centers, display_labels, rotation=0, fontsize=10)
-
-        sns.despine(offset=10, trim=True)
-        plt.tight_layout()
-        plt.savefig(outpath(f"plot_histogram_{g}.png"), dpi=300)
-        plt.close()
-
-    plt.figure(figsize=(7, 6))
-    for i, g in enumerate(genotypes):
-        m10 = results_store[g]['morisita_10']
-        plt.errorbar(comp_range_10, np.nanmean(m10, axis=1),
-                     yerr=np.nanstd(m10, axis=1, ddof=1) / np.sqrt(m10.shape[1]),
-                     fmt='-o', color=palette[i], label=g, linewidth=2, capsize=3, markersize=5)
-
-    plt.axhline(y=1.0, color='gray', linestyle='--', linewidth=1.5)
-    plt.xlabel(r'Compartment size ($\mu$m)', labelpad=10)
-    plt.ylabel(r'I-delta index ($I_\delta$)', labelpad=10)
-    plt.title(r"Morisita Index ($10\,\mu$m steps)", fontweight='bold', pad=15, fontsize=14)
-    plt.legend(frameon=True, fontsize=10, loc='best')
-    sns.despine(offset=10, trim=True)
-    plt.tight_layout()
-    plt.savefig(outpath('plot_morisita_10um.png'), dpi=300)
-    plt.close()
-
-    plt.figure(figsize=(7, 6))
-    for i, g in enumerate(genotypes):
-        m20 = results_store[g]['morisita_20']
-        plt.errorbar(comp_range_20, np.nanmean(m20, axis=1),
-                     yerr=np.nanstd(m20, axis=1, ddof=1) / np.sqrt(m20.shape[1]),
-                     fmt='-s', color=palette[i], label=g, linewidth=2, capsize=3, markersize=5)
-
-    plt.axhline(y=1.0, color='gray', linestyle='--', linewidth=1.5)
-    plt.xlabel(r'Compartment size ($\mu$m)', labelpad=10)
-    plt.ylabel(r'I-delta index ($I_\delta$)', labelpad=10)
-    plt.title(r"Morisita Index ($20\,\mu$m steps)", fontweight='bold', pad=15, fontsize=14)
-    plt.legend(frameon=True, fontsize=10, loc='best')
-    sns.despine(offset=10, trim=True)
-    plt.tight_layout()
-    plt.savefig(outpath('plot_morisita_20um.png'), dpi=300)
-    plt.close()
-
-    print("\n[Success] All plots generated as clean standalone figures!")
-
+# ==================== main analysis ====================
 
 def run_analysis(workbook_path):
-    """
-    Runs the full statistics + plotting pipeline on the given workbook.
-    Heavy analysis-only libraries are imported here, not at module level,
-    so a plain review session never loads them.
-    """
-    import pandas as pd
-    import seaborn as sns
-    from scipy.stats import shapiro, kruskal, f_oneway
-    import scikit_posthocs as sp
-
+    _load_analysis_libs()
     sns.set_theme(style="ticks", context="talk")
-    plt.rcParams['font.sans-serif'] = 'Arial'
-    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = ["Arial", "DejaVu Sans"]
 
-    output_dir = os.path.join(os.path.dirname(workbook_path), "analysis_output")
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(workbook_path)), ANALYSIS_DIR_NAME)
     os.makedirs(output_dir, exist_ok=True)
+    out = lambda n: os.path.join(output_dir, n)
 
-    def outpath(name):
-        return os.path.join(output_dir, name)
+    wb = load_workbook(workbook_path, data_only=True)
+    genotypes = [s for s in wb.sheetnames if s not in UTILITY_SHEETS]
+    print(f"[Info] Genotype sheets: {genotypes}")
 
-    comp_range_10 = np.arange(80, 410, 10)
-    comp_range_20 = np.arange(80, 420, 20)
+    res, fano_rows = {}, []
+    for g in genotypes:
+        ids, dens, lengths, peaks = read_sheet(wb, g)
+        imds, first, nf, fano, mor = compute_spatial_metrics(peaks, COMP_RANGE_20)
+        res[g] = dict(ids=ids, densities=dens, lengths=lengths, imds=imds, first_mit=first,
+                      norm_freq=nf, fano=fano, morisita=mor)
+        print(f"[Info] {g}: {len(ids)} animals, {sum(len(p) for p in peaks)} peaks")
+        fano_rows.append({"Genotype": g, "Fano Factor (Mean)": np.nanmean(fano), "Fano Factor (SEM)": sem(fano)})
 
-    xls = pd.ExcelFile(workbook_path)
-    genotypes = [s for s in xls.sheet_names if s not in UTILITY_SHEETS]
-    print(f"[Info] Found {len(genotypes)} genotype sheets to analyze: {genotypes}")
-
-    results_store = {}
-    fano_summary_list = []
-
-    for genotype in genotypes:
-        ids, dens, lengths, coords = parse_and_verify_sheet(workbook_path, genotype)
-        metrics = compute_spatial_metrics(coords, comp_range_10, comp_range_20)
-
-        results_store[genotype] = {
-            'ids': ids, 'densities': dens, 'lengths': lengths,
-            'imds': metrics[0], 'first_mit': metrics[1],
-            'abs_freq': metrics[2], 'norm_freq': metrics[3], 'fano': metrics[4],
-            'morisita_10': metrics[5], 'morisita_20': metrics[6]
-        }
-
-        fano_summary_list.append({
-            'Genotype': genotype,
-            'Fano Factor (Mean)': np.nanmean(metrics[4]),
-            'Fano Factor (SEM)': np.nanstd(metrics[4], ddof=1) / np.sqrt(np.sum(~np.isnan(metrics[4])))
-        })
-
-    print("\n================== FANO FACTOR METRIC REPORT ==================")
-    fano_df = pd.DataFrame(fano_summary_list)
+    fano_df = pd.DataFrame(fano_rows)
+    print("\n================== FANO FACTOR ==================")
     print(fano_df.to_string(index=False))
 
-    output_filename = outpath('Genotypes_Troubleshooting_Summary.xlsx')
-    with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
-        summary_rows = []
+    # ---- summary workbook ----
+    with pd.ExcelWriter(out("Genotypes_Summary.xlsx"), engine="openpyxl") as writer:
+        rows = []
         for g in genotypes:
-            res = results_store[g]
-            summary_rows.append({
-                'Genotype': g,
-                'Density Mean': np.mean(res['densities']), 'Density SEM': np.std(res['densities'], ddof=1) / np.sqrt(len(res['densities'])),
-                'Length Mean': np.mean(res['lengths']), 'Length SEM': np.std(res['lengths'], ddof=1) / np.sqrt(len(res['lengths'])),
-                '1st Mit Dist Mean': np.nanmean(res['first_mit']), '1st Mit Dist SEM': np.nanstd(res['first_mit'], ddof=1) / np.sqrt(np.sum(~np.isnan(res['first_mit'])))
-            })
-            max_len = max(len(x) for x in res['imds'])
-            padded = [x + [np.nan] * (max_len - len(x)) for x in res['imds']]
-            pd.DataFrame(np.array(padded).T, columns=res['ids']).to_excel(writer, sheet_name=f'{g}_Step_Distances', index=False)
-        pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Global_Morphology_Summary', index=False)
-    print(f"\n[Success] Unified validation sheet saved as '{output_filename}'!")
+            r = res[g]
+            rows.append({"Genotype": g, "N animals": len(r["ids"]),
+                         "Density Mean": np.nanmean(r["densities"]), "Density SEM": sem(r["densities"]),
+                         "Length Mean": np.nanmean(r["lengths"]), "Length SEM": sem(r["lengths"]),
+                         "First Mit Dist Mean": np.nanmean(r["first_mit"]), "First Mit Dist SEM": sem(r["first_mit"])})
+            width = max((len(x) for x in r["imds"]), default=0)
+            padded = [list(x) + [np.nan] * (width - len(x)) for x in r["imds"]]
+            pd.DataFrame(np.array(padded).T, columns=r["ids"]).to_excel(
+                writer, sheet_name=f"{g}_Step_Distances"[:31], index=False)
+        pd.DataFrame(rows).to_excel(writer, sheet_name="Global_Morphology_Summary", index=False)
+        def msd(x):
+            x = np.asarray(x, dtype=float)
+            x = x[~np.isnan(x)]
+            return f"{np.mean(x):.2f} \u00b1 {np.std(x, ddof=1):.2f}"
+        sd_rows = [{"Genotype": g,
+                    "N animals": len(res[g]["ids"]),
+                    "Density (per 100 um)": msd(res[g]["densities"]),
+                    "Process length (um)": msd(res[g]["lengths"]),
+                    "Distance of first mit (um)": msd(res[g]["first_mit"]),
+                    "Fano factor": msd(res[g]["fano"])} for g in genotypes]
+        pd.DataFrame(sd_rows).to_excel(writer, sheet_name="Mean_SD_Summary", index=False)
+        fano_df.to_excel(writer, sheet_name="Fano_Factor", index=False)
 
     # ---- statistics ----
-    print("\n================== STATISTICAL HYPOTHESIS REPORT ==================")
-    metrics_to_test = {
-        'Mitochondrial Density': [results_store[g]['densities'] for g in genotypes],
-        'Process Length': [results_store[g]['lengths'] for g in genotypes],
-        'Distance to 1st Mit': [[val for val in results_store[g]['first_mit'] if not pd.isna(val)] for g in genotypes]
+    print("\n================== STATISTICS ==================")
+    metrics = {
+        "Mitochondrial Density": "densities",
+        "Process Length": "lengths",
+        "Distance to First Mit": "first_mit",
     }
-
-    stats_report_rows = []
-    dunn_matrices = {}
-
-    for metric_name, data_groups in metrics_to_test.items():
-        print(f"\nTesting Metric: {metric_name}")
-
+    stats_rows, posthoc = [], {}
+    for name, key in metrics.items():
+        groups = [np.asarray(res[g][key], dtype=float) for g in genotypes]
+        groups = [x[~np.isnan(x)] for x in groups]
+        print(f"\nMetric: {name}")
         all_normal = True
-        for i, g in enumerate(genotypes):
-            clean_group_data = [v for v in data_groups[i] if not pd.isna(v)]
-
-            if len(clean_group_data) < 3:
-                print(f"  -> Shapiro-Wilk ({g}): Sample size too small (N={len(clean_group_data)}). Defaulting to Non-Normal.")
+        for g, x in zip(genotypes, groups):
+            if len(x) < 3:
+                print(f"  Shapiro-Wilk ({g}): N={len(x)} too small, treating as non-normal")
                 all_normal = False
                 continue
-
-            stat_sw, p_val_sw = shapiro(clean_group_data)
-            is_group_normal = p_val_sw > 0.05
-            print(f"  -> Shapiro-Wilk ({g}): p-value = {p_val_sw:.4f} " + ("(Normal)" if is_group_normal else "(NON-NORMAL)"))
-
-            if not is_group_normal:
-                all_normal = False
-
-        cleaned_groups = [[v for v in group if not pd.isna(v)] for group in data_groups]
+            p = shapiro(x)[1]
+            print(f"  Shapiro-Wilk ({g}): p = {p:.4f} " + ("(normal)" if p > 0.05 else "(NON-NORMAL)"))
+            all_normal &= p > 0.05
 
         if all_normal:
-            stat, p_val = f_oneway(*cleaned_groups)
-            test_name = "One-Way ANOVA"
-            print(f"  Parametric One-Way ANOVA Result: F-stat = {stat:.4f}, p-value = {p_val:.4f}")
-            if p_val < 0.05:
-                print("  Significant difference identified. Pairwise comparisons should be evaluated via Tukey's HSD.")
+            test, (stat, p) = "One-Way ANOVA", f_oneway(*groups)
+            print(f"  One-way ANOVA: F = {stat:.4f}, p = {p:.4f}")
+            if p < 0.05:
+                print("  Significant -> Tukey HSD p-values:")
+                t = tukey_hsd(*groups)
+                mat = pd.DataFrame(t.pvalue, index=genotypes, columns=genotypes)
+                print(mat.to_string())
+                posthoc[(name, "Tukey HSD")] = mat
         else:
-            stat, p_val = kruskal(*cleaned_groups)
-            test_name = "Kruskal-Wallis"
-            print(f"  Non-Parametric Kruskal-Wallis Result: H-stat = {stat:.4f}, p-value = {p_val:.4f}")
-
-            if p_val < 0.05:
-                print("  Significant difference identified. Running Dunn's Post-Hoc Test (Holm-corrected):")
-                flat_data = []
-                flat_groups = []
-                for idx, g in enumerate(genotypes):
-                    flat_data.extend(cleaned_groups[idx])
-                    flat_groups.extend([g] * len(cleaned_groups[idx]))
-
-                df_stat = pd.DataFrame({'Value': flat_data, 'Group': flat_groups})
-                dunn_matrix = sp.posthoc_dunn(df_stat, val_col='Value', group_col='Group', p_adjust='holm')
-                print(dunn_matrix.to_string())
-                dunn_matrices[metric_name] = dunn_matrix
+            test, (stat, p) = "Kruskal-Wallis", kruskal(*groups)
+            print(f"  Kruskal-Wallis: H = {stat:.4f}, p = {p:.4f}")
+            if p < 0.05:
+                print("  Significant -> Dunn's post-hoc (Holm):")
+                flat = pd.DataFrame({"Value": np.concatenate(groups),
+                                     "Group": np.repeat(genotypes, [len(x) for x in groups])})
+                mat = sp.posthoc_dunn(flat, val_col="Value", group_col="Group", p_adjust="holm")
+                mat = mat.loc[genotypes, genotypes]
+                print(mat.to_string())
+                posthoc[(name, "Dunn")] = mat
             else:
-                print("  No statistically significant baseline difference between genotypes.")
+                print("  No significant difference between genotypes.")
+        stats_rows.append({"Metric": name, "Test": test, "Statistic": round(stat, 4),
+                           "p-value": round(p, 4), "Significant (p<0.05)": "Yes" if p < 0.05 else "No"})
 
-        stats_report_rows.append({
-            'Metric': metric_name,
-            'Test': test_name,
-            'Statistic': round(stat, 4),
-            'p-value': round(p_val, 4),
-            'Significant (p<0.05)': 'Yes' if p_val < 0.05 else 'No',
-        })
+    stats_df = pd.DataFrame(stats_rows)
+    save_table_figure(fano_df, "Fano Factor Summary", out("table_fano_factor.png"), italic_first_col=True)
+    save_table_figure(stats_df, "Statistical Test Summary", out("table_stats_summary.png"))
+    for (name, kind), mat in posthoc.items():
+        save_table_figure(mat.reset_index().rename(columns={"index": "Group"}),
+                          f"{kind} Post-Hoc ({name})",
+                          out(f"table_{kind.split()[0].lower()}_{name.replace(' ', '_').lower()}.png"),
+                          italic_first_col=True, italic_header=True)
 
-    stats_df = pd.DataFrame(stats_report_rows)
-
-    # ---- stats + fano as table figures ----
-    save_table_figure(fano_df, "Fano Factor Summary", outpath("table_fano_factor.png"))
-    save_table_figure(stats_df, "Statistical Test Summary", outpath("table_stats_summary.png"))
-    for metric_name, dunn_matrix in dunn_matrices.items():
-        safe_name = metric_name.replace(" ", "_").lower()
-        save_table_figure(
-            dunn_matrix.reset_index().rename(columns={'index': 'Group'}),
-            f"Dunn's Post-Hoc ({metric_name})",
-            outpath(f"table_dunn_{safe_name}.png"),
-        )
-
-    # ---- plots ----
-    generate_publication_plots(results_store, genotypes, comp_range_10, comp_range_20, output_dir)
-
-    print(f"\n[Success] Analysis complete. Outputs saved in: {output_dir}")
+    pvals = {metrics[name]: mat for (name, _kind), mat in posthoc.items()}
+    generate_plots(res, genotypes, output_dir, pvals)
+    print(f"\n[Done] Outputs saved in: {output_dir}")
 
 
 def confirm_and_maybe_run_analysis():
@@ -899,7 +980,7 @@ def main():
 
     genotype_dirs = sorted(
         d for d in os.listdir(ROOT)
-        if os.path.isdir(os.path.join(ROOT, d))
+        if os.path.isdir(os.path.join(ROOT, d)) and d != ANALYSIS_DIR_NAME
     )
     print(f"Found {len(genotype_dirs)} genotype folder(s) under {ROOT}")
 
